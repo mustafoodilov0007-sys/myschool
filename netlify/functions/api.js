@@ -22,6 +22,11 @@ const SCHEMA = [
 `CREATE TABLE IF NOT EXISTS grades(id INTEGER PRIMARY KEY,student_id INTEGER NOT NULL REFERENCES students(id),class_id INTEGER NOT NULL,subject_id INTEGER NOT NULL,teacher_id INTEGER NOT NULL,date TEXT NOT NULL,type TEXT NOT NULL,value REAL NOT NULL,max REAL NOT NULL DEFAULT 5,comment TEXT,UNIQUE(student_id,subject_id,date,type))`,
 `CREATE TABLE IF NOT EXISTS attendance(id INTEGER PRIMARY KEY,student_id INTEGER NOT NULL REFERENCES students(id),class_id INTEGER NOT NULL,subject_id INTEGER NOT NULL,date TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN('keldi','kelmadi','kechikdi','uzrli')),note TEXT,UNIQUE(student_id,subject_id,date))`,
 `CREATE TABLE IF NOT EXISTS audit_logs(id INTEGER PRIMARY KEY,user_id INTEGER,action TEXT,entity TEXT,entity_id TEXT,old TEXT,new TEXT,at TEXT)`,
+`CREATE TABLE IF NOT EXISTS academic_years(id INTEGER PRIMARY KEY,name TEXT UNIQUE NOT NULL,start_date TEXT NOT NULL,end_date TEXT NOT NULL,is_current INTEGER NOT NULL DEFAULT 0)`,
+`CREATE TABLE IF NOT EXISTS terms(id INTEGER PRIMARY KEY,year_id INTEGER NOT NULL REFERENCES academic_years(id),name TEXT NOT NULL,start_date TEXT NOT NULL,end_date TEXT NOT NULL,UNIQUE(year_id,name))`,
+`CREATE TABLE IF NOT EXISTS bell_slots(id INTEGER PRIMARY KEY,no INTEGER UNIQUE NOT NULL,start TEXT NOT NULL,end TEXT NOT NULL)`,
+`CREATE TABLE IF NOT EXISTS grade_types(id INTEGER PRIMARY KEY,name TEXT UNIQUE NOT NULL,max REAL NOT NULL DEFAULT 5,weight REAL NOT NULL DEFAULT 1,is_active INTEGER NOT NULL DEFAULT 1)`,
+`INSERT OR IGNORE INTO grade_types(name,max,weight) VALUES('joriy',5,1),('nazorat',5,2),('uy vazifasi',5,1)`,
 `CREATE INDEX IF NOT EXISTS ix_g ON grades(class_id,subject_id)`,
 `CREATE INDEX IF NOT EXISTS ix_a ON attendance(class_id,date)`,
 `CREATE INDEX IF NOT EXISTS ix_t ON timetable(weekday,teacher_id)`];
@@ -31,6 +36,11 @@ const init = () => ready || (ready = (async () => {
   await db.batch(SCHEMA, 'write');
   const have = (await q('PRAGMA table_info(users)')).map(c => c.name); // xavfsiz migratsiya: faqat yetishmaydigan ustunlar qo'shiladi
   for (const c of [...UF, 'experience_years']) if (!have.includes(c)) await run(`ALTER TABLE users ADD COLUMN ${c} ${c === 'experience_years' ? 'INTEGER' : 'TEXT'}`);
+  if (!(await q('PRAGMA table_info(attendance)')).some(c => c.name === 'slot')) // davomatni dars (slot) kesimida yuritish: mavjud yozuvlar slot=0 bilan ko'chiriladi
+    await db.batch([
+      `CREATE TABLE attendance_new(id INTEGER PRIMARY KEY,student_id INTEGER NOT NULL REFERENCES students(id),class_id INTEGER NOT NULL,subject_id INTEGER NOT NULL,date TEXT NOT NULL,slot INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL CHECK(status IN('keldi','kelmadi','kechikdi','uzrli')),note TEXT,UNIQUE(student_id,subject_id,date,slot))`,
+      `INSERT INTO attendance_new(id,student_id,class_id,subject_id,date,slot,status,note) SELECT id,student_id,class_id,subject_id,date,0,status,note FROM attendance`,
+      `DROP TABLE attendance`, `ALTER TABLE attendance_new RENAME TO attendance`, `CREATE INDEX IF NOT EXISTS ix_a ON attendance(class_id,date)`], 'write');
   await run(`INSERT OR IGNORE INTO settings VALUES('school_name','Deutsch School MCHJ')`);
   if (!(await one('SELECT id FROM users LIMIT 1')) && process.env.ADMIN_PASSWORD)
     await run('INSERT INTO users(login,name,pass,role,created_at) VALUES(?,?,?,?,?)', [process.env.ADMIN_LOGIN || 'admin', 'Administrator', hash(process.env.ADMIN_PASSWORD), 'admin', now()]);
@@ -176,8 +186,75 @@ r('POST', '/students', async ({ u, b }) => {
 r('PATCH', '/students/(\\d+)', async ({ u, b, m }) => {
   const s = await one('SELECT * FROM students WHERE id=?', [+m[1]]); if (!s) bad('Topilmadi', 404);
   if (!(await homeroom(u, s.class_id)) || (b.class_id && !(await homeroom(u, +b.class_id)))) bad('Ruxsat yo\'q', 403);
-  await run('UPDATE students SET name=?,class_id=?,status=? WHERE id=?', [b.name ?? s.name, b.class_id ?? s.class_id, b.status ?? s.status, s.id]);
-  await audit(u, 'update', 'student', s.id, { class_id: s.class_id, status: s.status }, b); return { ok: 1 };
+  const name = b.name !== undefined ? String(b.name).trim() : s.name; if (name.length < 3) bad("F.I.Sh. kamida 3 belgi bo'lsin");
+  const code = b.code !== undefined ? (String(b.code).trim() || null) : s.code;
+  if (code && code !== s.code && await one('SELECT 1 x FROM students WHERE code=? AND id!=?', [code, s.id])) bad('Bu o\'quvchi kodi band', 409);
+  const status = b.status ?? s.status; if (!['faol', 'arxiv'].includes(status)) bad("Holat 'faol' yoki 'arxiv' bo'lsin");
+  const cls = b.class_id ? +b.class_id : s.class_id; if (!(await one('SELECT 1 x FROM classes WHERE id=?', [cls]))) bad('Sinf topilmadi');
+  const pc = b.parent_contact !== undefined ? (String(b.parent_contact).trim().slice(0, 200) || null) : s.parent_contact;
+  await run('UPDATE students SET name=?,code=?,class_id=?,status=?,parent_contact=? WHERE id=?', [name, code, cls, status, pc, s.id]);
+  await audit(u, 'update', 'student', s.id, { name: s.name, code: s.code, class_id: s.class_id, status: s.status }, { name, code, class_id: cls, status }); return { ok: 1 };
+});
+// O'quvchi individual sahifasi: o'qituvchi faqat o'z fanlarini ko'radi, sinf rahbari/admin/direktor hammasini
+r('GET', '/students/(\\d+)', async ({ u, m }) => {
+  const s = await one('SELECT st.*,c.name class_name,c.year FROM students st JOIN classes c ON c.id=st.class_id WHERE st.id=?', [+m[1]]); if (!s) bad('Topilmadi', 404);
+  if (!(await canView(u, s.class_id))) bad('Ruxsat yo\'q', 403);
+  const own = u.role === 'teacher' && !(await homeroom(u, s.class_id));
+  const sf = own ? ' AND x.subject_id IN(SELECT subject_id FROM assignments WHERE teacher_id=' + (+u.id) + ')' : '';
+  return {
+    student: s,
+    grades: await q(`SELECT x.date,x.type,x.value,x.max,x.comment,sb.name subject,c.name class_name FROM grades x JOIN subjects sb ON sb.id=x.subject_id JOIN classes c ON c.id=x.class_id WHERE x.student_id=?${sf} ORDER BY x.date DESC`, [s.id]),
+    attendance: await q(`SELECT x.date,x.status,x.note,sb.name subject FROM attendance x JOIN subjects sb ON sb.id=x.subject_id WHERE x.student_id=?${sf} ORDER BY x.date DESC`, [s.id])
+  };
+});
+
+// ===== O'quv yili, chorak, dars vaqtlari, baholash turlari =====
+const dOk = (d, n) => /^\d{4}-\d{2}-\d{2}$/.test(d || '') || bad(n + ' formati YYYY-MM-DD bo\'lsin');
+r('GET', '/academic_years', async () => ({ years: await q('SELECT * FROM academic_years ORDER BY start_date DESC'), terms: await q('SELECT * FROM terms ORDER BY start_date') }));
+r('POST', '/academic_years', async ({ u, b }) => {
+  need(u, 'admin'); const name = String(b.name || '').trim(); if (!name) bad("O'quv yili nomi kerak");
+  dOk(b.start_date, 'Boshlanish sanasi'); dOk(b.end_date, 'Tugash sanasi'); if (b.start_date >= b.end_date) bad('Tugash sanasi boshlanishdan keyin bo\'lsin');
+  if (await one('SELECT 1 x FROM academic_years WHERE name=?', [name])) bad('Bu o\'quv yili mavjud', 409);
+  const cur = b.is_current ? 1 : 0, stmts = [];
+  if (cur) stmts.push({ sql: 'UPDATE academic_years SET is_current=0', args: [] });
+  stmts.push({ sql: 'INSERT INTO academic_years(name,start_date,end_date,is_current) VALUES(?,?,?,?)', args: [name, b.start_date, b.end_date, cur] });
+  await db.batch(stmts, 'write'); await audit(u, 'create', 'academic_year', name, null, b); return { ok: 1 };
+});
+r('PATCH', '/academic_years/(\\d+)', async ({ u, b, m }) => {
+  need(u, 'admin'); const id = +m[1], y = await one('SELECT * FROM academic_years WHERE id=?', [id]); if (!y) bad('Topilmadi', 404);
+  const st = b.start_date ?? y.start_date, en = b.end_date ?? y.end_date; dOk(st, 'Boshlanish sanasi'); dOk(en, 'Tugash sanasi'); if (st >= en) bad('Tugash sanasi boshlanishdan keyin bo\'lsin');
+  const stmts = []; if (b.is_current) stmts.push({ sql: 'UPDATE academic_years SET is_current=0', args: [] });
+  stmts.push({ sql: 'UPDATE academic_years SET name=?,start_date=?,end_date=?,is_current=? WHERE id=?', args: [String(b.name ?? y.name).trim(), st, en, b.is_current === undefined ? y.is_current : (b.is_current ? 1 : 0), id] });
+  await db.batch(stmts, 'write'); await audit(u, 'update', 'academic_year', id, y, b); return { ok: 1 };
+});
+r('POST', '/terms', async ({ u, b }) => {
+  need(u, 'admin'); const y = await one('SELECT * FROM academic_years WHERE id=?', [+b.year_id]); if (!y) bad("O'quv yili topilmadi");
+  const name = String(b.name || '').trim(); if (!name) bad('Chorak/semestr nomi kerak'); dOk(b.start_date, 'Boshlanish sanasi'); dOk(b.end_date, 'Tugash sanasi');
+  if (b.start_date >= b.end_date) bad('Tugash sanasi boshlanishdan keyin bo\'lsin');
+  if (b.start_date < y.start_date || b.end_date > y.end_date) bad("Davr o'quv yili ichida bo'lishi kerak");
+  const ov = await one('SELECT name FROM terms WHERE year_id=? AND start_date<=? AND end_date>=?', [y.id, b.end_date, b.start_date]); if (ov) bad(`Davr "${ov.name}" bilan kesishadi`, 409);
+  try { await run('INSERT INTO terms(year_id,name,start_date,end_date) VALUES(?,?,?,?)', [y.id, name, b.start_date, b.end_date]); } catch { bad('Bu nomli davr mavjud', 409); }
+  await audit(u, 'create', 'term', name, null, b); return { ok: 1 };
+});
+r('GET', '/bell_slots', async () => q('SELECT * FROM bell_slots ORDER BY no'));
+r('PUT', '/bell_slots', async ({ u, b }) => { // butun ro'yxat almashtiriladi (tranzaksiya)
+  need(u, 'admin'); const L = Array.isArray(b.slots) ? b.slots : bad("slots massivi kerak");
+  if (L.length > 15) bad("Darslar soni 15 dan oshmasin");
+  L.forEach((x, i) => { hhmm(x.start); hhmm(x.end); if (x.start >= x.end) bad(`${i + 1}-dars: tugash vaqti boshlanishdan keyin bo'lsin`); if (i && x.start < L[i - 1].end) bad(`${i + 1}-dars oldingi dars bilan kesishadi`); });
+  await db.batch([{ sql: 'DELETE FROM bell_slots', args: [] }, ...L.map((x, i) => ({ sql: 'INSERT INTO bell_slots(no,start,end) VALUES(?,?,?)', args: [i + 1, x.start, x.end] }))], 'write');
+  await audit(u, 'update', 'bell_slots', '-', null, { count: L.length }); return { ok: 1 };
+});
+r('GET', '/grade_types', async () => q('SELECT * FROM grade_types ORDER BY id'));
+r('POST', '/grade_types', async ({ u, b }) => {
+  need(u, 'admin'); const name = String(b.name || '').trim().toLowerCase(), max = +b.max, w = b.weight === undefined ? 1 : +b.weight;
+  if (!name) bad('Baholash turi nomi kerak'); if (!(max > 0 && max <= 1000)) bad("Maksimal ball 0 dan katta bo'lsin"); if (!(w > 0 && w <= 100)) bad("Vazn 0 dan katta bo'lsin");
+  await run('INSERT INTO grade_types(name,max,weight) VALUES(?,?,?) ON CONFLICT(name) DO UPDATE SET max=excluded.max,weight=excluded.weight,is_active=1', [name, max, w]);
+  await audit(u, 'upsert', 'grade_type', name, null, { max, weight: w }); return { ok: 1 };
+});
+r('PATCH', '/grade_types/(\\d+)', async ({ u, b, m }) => {
+  need(u, 'admin'); const g = await one('SELECT * FROM grade_types WHERE id=?', [+m[1]]); if (!g) bad('Topilmadi', 404);
+  const max = b.max ?? g.max, w = b.weight ?? g.weight; if (!(+max > 0) || !(+w > 0)) bad("Ball va vazn 0 dan katta bo'lsin");
+  await run('UPDATE grade_types SET max=?,weight=?,is_active=? WHERE id=?', [+max, +w, b.is_active ?? g.is_active, g.id]); await audit(u, 'update', 'grade_type', g.id, g, b); return { ok: 1 };
 });
 
 r('GET', '/timetable', async ({ u, qs }) => {
@@ -205,7 +282,7 @@ r('GET', '/journal', async ({ u, qs }) => {
     can_edit: await teaches(u, c, s),
     students: await q("SELECT id,name,code FROM students WHERE class_id=? AND status='faol' ORDER BY name", [c]),
     grades: await q('SELECT student_id,date,type,value,max,comment FROM grades WHERE class_id=? AND subject_id=?', p),
-    attendance: await q('SELECT student_id,date,status,note FROM attendance WHERE class_id=? AND subject_id=?', p),
+    attendance: await q('SELECT student_id,date,slot,status,note FROM attendance WHERE class_id=? AND subject_id=?', p),
     lessons: await q('SELECT date,topic,homework,note FROM lessons WHERE class_id=? AND subject_id=? ORDER BY date DESC LIMIT 30', p)
   };
 });
@@ -222,13 +299,14 @@ r('PUT', '/grades', async ({ u, b }) => {
   await audit(u, old ? 'update' : 'create', 'grade', `${sid}-${s}-${date}-${type}`, old && { value: old.value, max: old.max }, { value: v, max }); return { ok: 1 };
 });
 r('PUT', '/attendance', async ({ u, b }) => {
-  const { student_id: sid, class_id: c, subject_id: s, date } = b; dateOk(date);
-  if (!(await teaches(u, c, s))) bad('Ruxsatingiz yo\'q', 403); await needStudent(sid, c);
-  const old = await one('SELECT * FROM attendance WHERE student_id=? AND subject_id=? AND date=?', [sid, s, date]);
+  const { student_id: sid, class_id: c, subject_id: sj, date } = b; dateOk(date);
+  const slot = b.slot === undefined || b.slot === null || b.slot === '' ? 0 : +b.slot; if (!Number.isInteger(slot) || slot < 0 || slot > 15) bad("Dars raqami 0–15 bo'lsin");
+  if (!(await teaches(u, c, sj))) bad('Ruxsatingiz yo\'q', 403); await needStudent(sid, c);
+  const old = await one('SELECT * FROM attendance WHERE student_id=? AND subject_id=? AND date=? AND slot=?', [sid, sj, date, slot]);
   if (!b.status) { if (old) { await run('DELETE FROM attendance WHERE id=?', [old.id]); await audit(u, 'delete', 'attendance', old.id, old, null); } return { ok: 1 }; }
   if (!ST.includes(b.status)) bad('Noto\'g\'ri holat');
-  await run('INSERT INTO attendance(student_id,class_id,subject_id,date,status,note) VALUES(?,?,?,?,?,?) ON CONFLICT(student_id,subject_id,date) DO UPDATE SET status=excluded.status,note=excluded.note', [sid, c, s, date, b.status, b.note || null]);
-  await audit(u, old ? 'update' : 'create', 'attendance', `${sid}-${s}-${date}`, old && { status: old.status }, { status: b.status }); return { ok: 1 };
+  await run('INSERT INTO attendance(student_id,class_id,subject_id,date,slot,status,note) VALUES(?,?,?,?,?,?,?) ON CONFLICT(student_id,subject_id,date,slot) DO UPDATE SET status=excluded.status,note=excluded.note', [sid, c, sj, date, slot, b.status, b.note || null]);
+  await audit(u, old ? 'update' : 'create', 'attendance', `${sid}-${sj}-${date}-${slot}`, old && { status: old.status, note: old.note }, { status: b.status, note: b.note || null }); return { ok: 1 };
 });
 r('PUT', '/lessons', async ({ u, b }) => {
   const { class_id: c, subject_id: s, date } = b; dateOk(date); if (!(await teaches(u, c, s))) bad('Ruxsatingiz yo\'q', 403);
@@ -248,10 +326,108 @@ r('GET', '/reports/class', async ({ u, qs }) => {
   };
 });
 r('GET', '/audit', async ({ u }) => { need(u, 'admin'); return q('SELECT a.*,u.name user FROM audit_logs a LEFT JOIN users u ON u.id=a.user_id ORDER BY a.id DESC LIMIT 200'); });
+
+// ===== Hisobotlar, boshqaruv paneli, Excel =====
+const tashkentToday = () => new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Tashkent' });
+const rangeOk = qs => { dOk(qs.from, 'from'); dOk(qs.to, 'to'); if (qs.from > qs.to) bad("Boshlanish sanasi tugashdan keyin bo'lmasin"); if ((Date.parse(qs.to) - Date.parse(qs.from)) / 864e5 > 366) bad("Davr 1 yildan oshmasin"); };
+r('GET', '/reports/attendance', async ({ u, qs }) => { // sinf bo'yicha davomat: kun/hafta/oy/chorak — from..to bilan
+  const c = +qs.class_id; if (!c) bad('class_id kerak'); rangeOk(qs); if (!(await canView(u, c))) bad('Ruxsat yo\'q', 403);
+  const own = u.role === 'teacher' && !(await homeroom(u, c)), a = [c, qs.from, qs.to]; let f = '';
+  if (own) { f = ' AND subject_id IN(SELECT subject_id FROM assignments WHERE class_id=? AND teacher_id=?)'; a.push(c, u.id); }
+  if (qs.subject_id) { f += ' AND subject_id=?'; a.push(+qs.subject_id); }
+  const rows = await q(`SELECT student_id,status,COUNT(*) n FROM attendance WHERE class_id=? AND date BETWEEN ? AND ?${f} GROUP BY student_id,status`, a);
+  const students = (await q('SELECT id,name,status FROM students WHERE class_id=? ORDER BY status,name', [c])).map(s => {
+    const o = { id: s.id, name: s.name, status: s.status, keldi: 0, kelmadi: 0, kechikdi: 0, uzrli: 0 };
+    rows.filter(x => x.student_id === s.id).forEach(x => { o[x.status] = x.n; }); o.jami = o.keldi + o.kelmadi + o.kechikdi + o.uzrli; return o;
+  });
+  const total = { keldi: 0, kelmadi: 0, kechikdi: 0, uzrli: 0 }; students.forEach(s => { for (const k in total) total[k] += s[k]; });
+  return { from: qs.from, to: qs.to, students, total, note: "Faqat belgilangan davomat hisoblanadi; belgilanmagan 'keldi' deb olinmaydi." };
+});
+r('GET', '/reports/journal_fill', async ({ u, qs }) => { // o'qituvchi jadvalidagi darslar va ularning mavzusi kiritilganlik holati
+  need(u, 'admin', 'director', 'teacher'); rangeOk(qs);
+  const tid = u.role === 'teacher' ? u.id : (+qs.teacher_id || 0);
+  const tt = await q(`SELECT t.class_id,t.subject_id,t.teacher_id,t.weekday,c.name class,s.name subject,us.name teacher FROM timetable t JOIN classes c ON c.id=t.class_id JOIN subjects s ON s.id=t.subject_id JOIN users us ON us.id=t.teacher_id${tid ? ' WHERE t.teacher_id=?' : ''}`, tid ? [tid] : []);
+  const done = new Set((await q("SELECT class_id,subject_id,date FROM lessons WHERE date BETWEEN ? AND ? AND trim(coalesce(topic,''))!=''", [qs.from, qs.to])).map(x => `${x.class_id}|${x.subject_id}|${x.date}`));
+  const planned = new Set(), by = {}; const end = Date.parse(qs.to + 'T12:00:00Z');
+  for (let t = Date.parse(qs.from + 'T12:00:00Z'); t <= end; t += 864e5) {
+    const d = new Date(t).toISOString().slice(0, 10), w = new Date(t).getUTCDay() || 7;
+    for (const x of tt) if (x.weekday === w) {
+      const k = `${x.class_id}|${x.subject_id}|${d}|${x.teacher_id}`; if (planned.has(k)) continue; planned.add(k);
+      const g = by[x.teacher_id] ??= { teacher_id: x.teacher_id, teacher: x.teacher, planned: 0, filled: 0 };
+      g.planned++; if (done.has(`${x.class_id}|${x.subject_id}|${d}`)) g.filled++;
+    }
+  }
+  return { from: qs.from, to: qs.to, rows: Object.values(by).map(g => ({ ...g, percent: g.planned ? Math.round(g.filled * 100 / g.planned) : null })).sort((a, b) => a.teacher.localeCompare(b.teacher)) };
+});
+r('GET', '/dashboard', async ({ u }) => {
+  const today = tashkentToday(), wd = new Date(today + 'T12:00:00Z').getUTCDay() || 7, tch = u.role === 'teacher';
+  const cl = tch ? await q('SELECT id FROM classes WHERE homeroom_id=? UNION SELECT class_id FROM assignments WHERE teacher_id=?', [u.id, u.id]) : await q('SELECT id FROM classes');
+  const ids = cl.map(x => x.id), ph = ids.map(() => '?').join(',') || 'NULL';
+  const subs = tch ? (await q('SELECT class_id,subject_id FROM assignments WHERE teacher_id=?', [u.id])) : null;
+  const att = await q(`SELECT a.status,COUNT(*) n FROM attendance a WHERE a.date=?${tch ? ` AND a.subject_id IN(SELECT subject_id FROM assignments WHERE class_id=a.class_id AND teacher_id=${+u.id})` : ''} GROUP BY a.status`, [today]);
+  return {
+    date: today, weekday: wd, role: u.role,
+    classes: ids.length, students: (await one(`SELECT COUNT(*) n FROM students WHERE status='faol' AND class_id IN(${ph})`, ids)).n,
+    lessons_today: await q(`SELECT t.start,t.end,t.room,c.name class,s.name subject,us.name teacher,t.class_id,t.subject_id FROM timetable t JOIN classes c ON c.id=t.class_id JOIN subjects s ON s.id=t.subject_id JOIN users us ON us.id=t.teacher_id WHERE t.weekday=?${tch ? ' AND t.teacher_id=?' : ''} ORDER BY t.start`, tch ? [wd, u.id] : [wd]),
+    attendance_today: Object.fromEntries(['keldi', 'kelmadi', 'kechikdi', 'uzrli'].map(k => [k, (att.find(x => x.status === k) || { n: 0 }).n])),
+    recent_grades: await q(`SELECT g.date,g.type,g.value,g.max,st.name student,c.name class,s.name subject FROM grades g JOIN students st ON st.id=g.student_id JOIN classes c ON c.id=g.class_id JOIN subjects s ON s.id=g.subject_id${tch ? ' WHERE g.teacher_id=?' : ''} ORDER BY g.id DESC LIMIT 8`, tch ? [u.id] : []),
+    scope: tch ? 'faqat o\'zingizga tegishli' : 'butun maktab'
+  };
+});
+
+// Minimal .xlsx yozuvchi (qo'shimcha kutubxonasiz): zlib + oddiy ZIP
+const zlib = require('zlib');
+const CRC = (() => { const t = []; for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return b => { let c = 0xFFFFFFFF; for (const x of b) c = t[(c ^ x) & 255] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }; })();
+function zip(files) {
+  const loc = [], cen = []; let off = 0;
+  for (const [name, text] of files) {
+    const n = Buffer.from(name), raw = Buffer.from(text), def = zlib.deflateRawSync(raw), crc = CRC(raw);
+    const h = Buffer.alloc(30); h.writeUInt32LE(0x04034b50, 0); h.writeUInt16LE(20, 4); h.writeUInt16LE(0x0800, 6); h.writeUInt16LE(8, 8); h.writeUInt32LE(crc, 14); h.writeUInt32LE(def.length, 18); h.writeUInt32LE(raw.length, 22); h.writeUInt16LE(n.length, 26);
+    const c = Buffer.alloc(46); c.writeUInt32LE(0x02014b50, 0); c.writeUInt16LE(20, 4); c.writeUInt16LE(20, 6); c.writeUInt16LE(0x0800, 8); c.writeUInt16LE(8, 10); c.writeUInt32LE(crc, 16); c.writeUInt32LE(def.length, 20); c.writeUInt32LE(raw.length, 24); c.writeUInt16LE(n.length, 28); c.writeUInt32LE(off, 42);
+    loc.push(h, n, def); cen.push(c, n); off += 30 + n.length + def.length;
+  }
+  const cd = Buffer.concat(cen), e = Buffer.alloc(22); e.writeUInt32LE(0x06054b50, 0); e.writeUInt16LE(files.length, 8); e.writeUInt16LE(files.length, 10); e.writeUInt32LE(cd.length, 12); e.writeUInt32LE(off, 16);
+  return Buffer.concat([...loc, cd, e]);
+}
+const xe = v => String(v ?? '').replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const colName = i => { let s = ''; for (i++; i; i = Math.floor((i - 1) / 26)) s = String.fromCharCode(65 + (i - 1) % 26) + s; return s; };
+function xlsx(rows, sheet) {
+  const sd = rows.map((r, i) => `<row r="${i + 1}">${r.map((v, j) => typeof v === 'number' && isFinite(v) ? `<c r="${colName(j)}${i + 1}"><v>${v}</v></c>` : `<c r="${colName(j)}${i + 1}" t="inlineStr"><is><t xml:space="preserve">${xe(v)}</t></is></c>`).join('')}</row>`).join('');
+  const X = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
+  return zip([
+    ['[Content_Types].xml', X + '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>'],
+    ['_rels/.rels', X + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>'],
+    ['xl/workbook.xml', X + `<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="${xe(sheet).replace(/[\[\]*?:\/\\]/g, ' ').slice(0, 31) || 'Hisobot'}" sheetId="1" r:id="rId1"/></sheets></workbook>`],
+    ['xl/_rels/workbook.xml.rels', X + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>'],
+    ['xl/worksheets/sheet1.xml', X + `<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>${sd}</sheetData></worksheet>`]]);
+}
+r('POST', '/export/xlsx', async ({ b }) => { // faqat mijoz yuborgan (allaqachon ruxsat bilan olingan) jadvalni .xlsx ga o'giradi; bazaga tegmaydi
+  const rows = Array.isArray(b.rows) ? b.rows : bad('rows kerak'); if (rows.length > 5000 || rows.some(x => !Array.isArray(x) || x.length > 60)) bad('Jadval juda katta');
+  return { name: String(b.name || 'hisobot').replace(/[^\w.-]+/g, '_').slice(0, 60) + '.xlsx', base64: xlsx(rows, String(b.sheet || 'Hisobot')).toString('base64') };
+});
+
+const BK = ['settings', 'users', 'subjects', 'teacher_subjects', 'classes', 'assignments', 'students', 'timetable', 'lessons', 'grades', 'attendance', 'academic_years', 'terms', 'bell_slots', 'grade_types', 'audit_logs'];
 r('GET', '/backup', async ({ u }) => {
-  need(u, 'admin'); const out = { exported_at: now() };
-  for (const t of ['settings', 'users', 'subjects', 'classes', 'assignments', 'students', 'timetable', 'lessons', 'grades', 'attendance', 'audit_logs']) out[t] = await q(`SELECT * FROM ${t}`);
+  need(u, 'admin'); const out = { version: 2, exported_at: now() };
+  for (const t of BK) out[t] = await q(`SELECT * FROM ${t}`);
   out.users.forEach(x => delete x.pass); return out;
+});
+// Tiklash: yagona tranzaksiya (xato bo'lsa hech narsa o'zgarmaydi). Foydalanuvchilar o'chirilmaydi:
+// zaxirada bor, lekin bazada yo'q xodimlar faolsiz va parolsiz tiklanadi (admin yangi parol beradi).
+r('POST', '/restore', async ({ u, b }) => {
+  need(u, 'admin'); if (b.confirm !== 'TIKLASH') bad('Tasdiqlash uchun confirm:"TIKLASH" yuboring');
+  const d = b.data; if (!d || typeof d !== 'object' || !Array.isArray(d.classes) || !Array.isArray(d.students) || d.version !== 2 || !d.exported_at || !Array.isArray(d.users)) bad("Zaxira fayli noto'g'ri yoki bu tizimning zaxirasi emas");
+  const cols = {}; for (const t of BK) cols[t] = (await q(`PRAGMA table_info(${t})`)).map(c => c.name);
+  const ins = (t, row) => { const ks = Object.keys(row).filter(k => cols[t].includes(k)); return { sql: `INSERT INTO ${t}(${ks.join(',')}) VALUES(${ks.map(() => '?').join(',')})`, args: ks.map(k => row[k] ?? null) }; };
+  const wipe = ['attendance', 'grades', 'lessons', 'timetable', 'students', 'assignments', 'teacher_subjects', 'classes', 'subjects', 'terms', 'academic_years', 'bell_slots', 'grade_types'];
+  const fill = ['subjects', 'classes', 'students', 'assignments', 'teacher_subjects', 'timetable', 'lessons', 'grades', 'attendance', 'academic_years', 'terms', 'bell_slots', 'grade_types'];
+  const have = new Set((await q('SELECT id FROM users')).map(x => x.id)), st = [];
+  for (const x of d.users || []) if (!have.has(x.id)) st.push({ sql: 'INSERT INTO users(id,login,name,pass,role,is_active,created_at) VALUES(?,?,?,?,?,0,?)', args: [x.id, x.login, x.name, 'x:x', x.role, x.created_at || null] });
+  for (const t of wipe) st.push({ sql: `DELETE FROM ${t}`, args: [] });
+  for (const t of fill) for (const row of d[t] || []) st.push(ins(t, row));
+  await db.batch(st, 'write');
+  await audit(u, 'restore', 'backup', '-', null, { exported_at: d.exported_at, classes: d.classes.length, students: d.students.length });
+  return { ok: 1, restored: Object.fromEntries(fill.map(t => [t, (d[t] || []).length])) };
 });
 
 exports.handler = async ev => {

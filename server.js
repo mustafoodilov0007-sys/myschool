@@ -7,8 +7,8 @@ const MIME = { '.html': 'text/html; charset=utf-8', '.css': 'text/css', '.js': '
 http.createServer((req, res) => {
   const url = new URL(req.url, 'http://x');
   if (url.pathname.startsWith('/api/')) {
-    const chunks = []; let size = 0;
-    req.on('data', c => { size += c.length; if (size > 2e6) req.destroy(); else chunks.push(c); });
+    const chunks = []; let size = 0; const LIM = url.pathname === '/api/restore' ? 5e7 : 2e6; // zaxirani tiklash katta bo'lishi mumkin
+    req.on('data', c => { size += c.length; if (size > LIM) req.destroy(); else chunks.push(c); });
     req.on('end', async () => {
       const r = await handler({ httpMethod: req.method, path: url.pathname, headers: req.headers,
         body: chunks.length ? Buffer.concat(chunks).toString() : null, queryStringParameters: Object.fromEntries(url.searchParams) });
