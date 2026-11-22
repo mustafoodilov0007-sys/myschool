@@ -2,6 +2,7 @@ const { createClient } = require('@libsql/client');
 const crypto = require('crypto');
 const db = createClient({ url: process.env.TURSO_DATABASE_URL || ('file:' + (process.env.RAILWAY_VOLUME_MOUNT_PATH || '/tmp') + '/school.db'), authToken: process.env.TURSO_AUTH_TOKEN });
 const SECRET = process.env.SESSION_SECRET || '';
+const UF = ['first_name','last_name','middle_name','phone','email','birth_date','gender','hire_date','education','category','bio','photo'];
 const ST = ['keldi', 'kelmadi', 'kechikdi', 'uzrli'];
 const q = async (sql, args = []) => (await db.execute({ sql, args })).rows.map(r => ({ ...r }));
 const one = async (sql, args) => (await q(sql, args))[0];
@@ -11,6 +12,7 @@ const now = () => new Date().toISOString().replace('T', ' ').slice(0, 19); // UT
 const SCHEMA = [
 `CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT)`,
 `CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,login TEXT UNIQUE NOT NULL,name TEXT NOT NULL,pass TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN('admin','director','teacher')),is_active INTEGER NOT NULL DEFAULT 1,created_at TEXT)`,
+`CREATE TABLE IF NOT EXISTS teacher_subjects(user_id INTEGER NOT NULL REFERENCES users(id),subject_id INTEGER NOT NULL REFERENCES subjects(id),PRIMARY KEY(user_id,subject_id))`,
 `CREATE TABLE IF NOT EXISTS subjects(id INTEGER PRIMARY KEY,name TEXT UNIQUE NOT NULL)`,
 `CREATE TABLE IF NOT EXISTS classes(id INTEGER PRIMARY KEY,name TEXT NOT NULL,year TEXT NOT NULL,homeroom_id INTEGER REFERENCES users(id),UNIQUE(name,year))`,
 `CREATE TABLE IF NOT EXISTS assignments(id INTEGER PRIMARY KEY,class_id INTEGER NOT NULL REFERENCES classes(id),subject_id INTEGER NOT NULL REFERENCES subjects(id),teacher_id INTEGER NOT NULL REFERENCES users(id),UNIQUE(class_id,subject_id))`,
@@ -27,6 +29,8 @@ const SCHEMA = [
 let ready;
 const init = () => ready || (ready = (async () => {
   await db.batch(SCHEMA, 'write');
+  const have = (await q('PRAGMA table_info(users)')).map(c => c.name); // xavfsiz migratsiya: faqat yetishmaydigan ustunlar qo'shiladi
+  for (const c of [...UF, 'experience_years']) if (!have.includes(c)) await run(`ALTER TABLE users ADD COLUMN ${c} ${c === 'experience_years' ? 'INTEGER' : 'TEXT'}`);
   await run(`INSERT OR IGNORE INTO settings VALUES('school_name','Deutsch School MCHJ')`);
   if (!(await one('SELECT id FROM users LIMIT 1')) && process.env.ADMIN_PASSWORD)
     await run('INSERT INTO users(login,name,pass,role,created_at) VALUES(?,?,?,?,?)', [process.env.ADMIN_LOGIN || 'admin', 'Administrator', hash(process.env.ADMIN_PASSWORD), 'admin', now()]);
@@ -65,7 +69,7 @@ const needStudent = async (id, c) => { const s = await one('SELECT * FROM studen
 const routes = [];
 const r = (m, p, f) => routes.push([m, new RegExp('^' + p + '$'), f]);
 
-r('GET', '/public', async () => ({ school_name: (await one("SELECT value v FROM settings WHERE key='school_name'")).v }));
+r('GET', '/public', async () => { const s = Object.fromEntries((await q('SELECT key,value FROM settings')).map(x => [x.key, x.value])); return { school_name: s.school_name, logo: s.logo || null, brand: s.brand || null }; });
 r('POST', '/login', async ({ b }) => {
   if (!SECRET) bad('Server sozlanmagan', 500);
   const u = await one('SELECT * FROM users WHERE login=?', [String(b.login || '')]);
@@ -74,22 +78,73 @@ r('POST', '/login', async ({ b }) => {
 });
 r('POST', '/logout', async () => ({ cookie: '' }));
 r('GET', '/me', async ({ u }) => u);
-r('PUT', '/settings', async ({ u, b }) => { need(u, 'admin'); await run("UPDATE settings SET value=? WHERE key='school_name'", [String(b.school_name || '').slice(0, 100)]); return { ok: 1 }; });
+r('PUT', '/settings', async ({ u, b }) => {
+  need(u, 'admin'); const set = (k, v) => run('INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', [k, v]);
+  if (b.school_name !== undefined) { const n = String(b.school_name).trim().slice(0, 100); if (n.length < 2) bad('Maktab nomi juda qisqa'); await set('school_name', n); }
+  if (b.brand !== undefined && b.brand && !/^#[0-9a-fA-F]{6}$/.test(b.brand)) bad("Rang #RRGGBB formatida bo'lsin");
+  if (b.logo && (String(b.logo).length > 300000 || !/^data:image\/(png|jpeg|webp);base64,/.test(b.logo))) bad("Logo PNG/JPG/WEBP va 300 KB dan kichik bo'lsin");
+  if (b.brand !== undefined) await set('brand', b.brand || '');
+  if (b.logo !== undefined) await set('logo', b.logo || '');
+  await audit(u, 'update', 'settings', '-', null, { keys: Object.keys(b) }); return { ok: 1 };
+});
 
-r('GET', '/users', async ({ u }) => { need(u, 'admin', 'director'); return q('SELECT id,login,name,role,is_active FROM users ORDER BY name'); });
+const ROLES = ['admin', 'director', 'teacher'];
+function profile(b, full) {
+  const o = {};
+  if (b.photo && String(b.photo).length > 300000) bad("Rasm juda katta");
+  for (const k of UF) if (b[k] !== undefined) o[k] = String(b[k] ?? '').trim().slice(0, k === 'photo' ? 300000 : 500) || null;
+  if (b.experience_years !== undefined) {
+    if (b.experience_years === '' || b.experience_years === null) o.experience_years = null;
+    else { const n = +b.experience_years; if (!(n >= 0 && n <= 60)) bad("Staj 0–60 yil oralig'ida bo'lishi kerak"); o.experience_years = Math.round(n); }
+  }
+  if ((full || 'first_name' in o) && (!o.first_name || o.first_name.length < 2)) bad("Ism kamida 2 harfdan iborat bo'lsin");
+  if ((full || 'last_name' in o) && (!o.last_name || o.last_name.length < 2)) bad("Familiya kamida 2 harfdan iborat bo'lsin");
+  if (o.phone && !/^\+?[0-9 ()-]{7,20}$/.test(o.phone)) bad("Telefon raqami noto'g'ri");
+  if (o.email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(o.email)) bad("Email noto'g'ri");
+  for (const d of ['birth_date', 'hire_date']) if (o[d] && !/^\d{4}-\d{2}-\d{2}$/.test(o[d])) bad("Sana formati noto'g'ri");
+  if (o.gender && !['erkak', 'ayol'].includes(o.gender)) bad("Jins noto'g'ri");
+  if (o.photo && !/^data:image\/(jpeg|png|webp);base64,/.test(o.photo)) bad("Rasm formati noto'g'ri");
+  return o;
+}
+async function subjIds(ids) {
+  const c = [...new Set((Array.isArray(ids) ? ids : []).map(Number))];
+  for (const x of c) if (!(await one('SELECT 1 x FROM subjects WHERE id=?', [x]))) bad('Fan topilmadi');
+  return c;
+}
+const writeSubj = (uid, c) => db.batch([{ sql: 'DELETE FROM teacher_subjects WHERE user_id=?', args: [uid] }, ...c.map(x => ({ sql: 'INSERT INTO teacher_subjects VALUES(?,?)', args: [uid, x] }))], 'write');
+const USEL = 'SELECT id,login,name,first_name,last_name,middle_name,phone,email,birth_date,gender,hire_date,experience_years,education,category,bio,photo,role,is_active FROM users';
+
+r('GET', '/users', async ({ u }) => {
+  need(u, 'admin', 'director');
+  const us = await q(USEL + ' ORDER BY name');
+  const ts = await q('SELECT ts.user_id,s.id sid,s.name FROM teacher_subjects ts JOIN subjects s ON s.id=ts.subject_id');
+  us.forEach(x => { x.subjects = ts.filter(t => t.user_id == x.id).map(t => ({ id: t.sid, name: t.name })); });
+  return us;
+});
 r('POST', '/users', async ({ u, b }) => {
-  need(u, 'admin');
-  if (!b.login || !b.name || String(b.password || '').length < 8) bad('Login, ism va kamida 8 belgili parol kerak');
-  if (!['admin', 'director', 'teacher'].includes(b.role)) bad('Noto\'g\'ri rol');
+  need(u, 'admin'); const o = profile(b, true);
+  if (!/^[a-z0-9._-]{3,30}$/i.test(b.login || '')) bad("Login 3–30 ta lotin harf, raqam yoki . _ - belgilaridan iborat bo'lsin");
+  if (String(b.password || '').length < 8) bad("Parol kamida 8 belgi bo'lsin");
+  if (!ROLES.includes(b.role)) bad("Noto'g'ri rol");
   if (await one('SELECT 1 x FROM users WHERE login=?', [b.login])) bad('Bu login band', 409);
-  const x = await run('INSERT INTO users(login,name,pass,role,created_at) VALUES(?,?,?,?,?)', [b.login, b.name, hash(b.password), b.role, now()]);
-  await audit(u, 'create', 'user', x.lastInsertRowid, null, { login: b.login, role: b.role }); return { id: Number(x.lastInsertRowid) };
+  const sids = await subjIds(b.subject_ids);
+  const name = [o.last_name, o.first_name, o.middle_name].filter(Boolean).join(' ');
+  const x = await run(`INSERT INTO users(login,name,pass,role,created_at,experience_years,${UF.join(',')}) VALUES(?,?,?,?,?,?,${UF.map(() => '?').join(',')})`,
+    [b.login, name, hash(b.password), b.role, now(), o.experience_years ?? null, ...UF.map(k => o[k] ?? null)]);
+  const id = Number(x.lastInsertRowid); await writeSubj(id, sids);
+  await audit(u, 'create', 'user', id, null, { login: b.login, role: b.role, subjects: sids }); return { id };
 });
 r('PATCH', '/users/(\\d+)', async ({ u, b, m }) => {
-  need(u, 'admin'); const id = +m[1]; const o = await one('SELECT * FROM users WHERE id=?', [id]); if (!o) bad('Topilmadi', 404);
-  if (id === u.id && b.is_active === 0) bad('O\'zingizni faolsizlantira olmaysiz');
-  await run('UPDATE users SET name=?,role=?,is_active=?,pass=? WHERE id=?', [b.name ?? o.name, b.role ?? o.role, b.is_active ?? o.is_active, b.password ? hash(b.password) : o.pass, id]);
-  await audit(u, 'update', 'user', id, { role: o.role, is_active: o.is_active }, { role: b.role, is_active: b.is_active }); return { ok: 1 };
+  need(u, 'admin'); const id = +m[1]; const old = await one('SELECT * FROM users WHERE id=?', [id]); if (!old) bad('Topilmadi', 404);
+  if (id === u.id && b.is_active === 0) bad("O'zingizni faolsizlantira olmaysiz");
+  if (b.role && !ROLES.includes(b.role)) bad("Noto'g'ri rol");
+  if (b.password && String(b.password).length < 8) bad("Parol kamida 8 belgi bo'lsin");
+  const o = profile(b, false), sids = b.subject_ids !== undefined ? await subjIds(b.subject_ids) : null;
+  const n = { ...old, ...o }; n.name = [n.last_name, n.first_name, n.middle_name].filter(Boolean).join(' ') || old.name;
+  await run(`UPDATE users SET name=?,role=?,is_active=?,pass=?,experience_years=?,${UF.map(k => k + '=?').join(',')} WHERE id=?`,
+    [n.name, b.role ?? old.role, b.is_active ?? old.is_active, b.password ? hash(b.password) : old.pass, n.experience_years ?? null, ...UF.map(k => n[k] ?? null), id]);
+  if (sids) await writeSubj(id, sids);
+  await audit(u, 'update', 'user', id, { role: old.role, is_active: old.is_active }, { role: b.role, is_active: b.is_active, fields: Object.keys(o).filter(k => k !== 'photo'), subjects: sids }); return { ok: 1 };
 });
 
 r('GET', '/subjects', async () => q('SELECT * FROM subjects ORDER BY name'));
