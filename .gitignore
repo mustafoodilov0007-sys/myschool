@@ -1,4 +1,12 @@
-node_modules
-*.db
-*.db-*
+node_modules/
+dist/
+build/
+coverage/
 .env
+.env.*
+!.env.example
+*.log
+uploads/
+backups/
+.DS_Store
+.vite/
